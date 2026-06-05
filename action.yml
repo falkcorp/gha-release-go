@@ -1,18 +1,26 @@
+# file: action.yml
+# version: 2.0.0
+
 name: 'Go Release Build'
 description: 'Build and release Go binaries via GoReleaser'
-author: 'jdfalk'
+author: 'falkcorp'
+
+branding:
+  icon: 'box'
+  color: 'blue'
 
 inputs:
+  # --- orchestration inputs (from wrapper) ---
   go-matrix:
-    description: 'JSON encoded Go build matrix'
+    description: 'JSON encoded Go build matrix (informational; steps use module-path)'
     required: false
     default: '{}'
   protobuf-artifacts:
-    description: 'Whether protobuf artifacts are available'
+    description: 'Whether protobuf artifacts are available from an earlier job step'
     required: false
     default: 'false'
   release-version:
-    description: 'Release version to embed in binaries'
+    description: 'Release version to embed in binaries (overrides github.ref_name)'
     required: false
     default: ''
   system-packages:
@@ -28,14 +36,73 @@ inputs:
     required: false
     default: ''
   github-token:
-    description: 'Token used for git push of release tags. Must have
-      workflows:write when the tag includes commits that modify
-      .github/workflows/ files (typically a GitHub App installation
-      token minted via actions/create-github-app-token). Falls back
-      to the default GITHUB_TOKEN for runs that do not touch workflow
-      files.'
+    description: >
+      Token used for git push of release tags. Must have workflows:write when
+      the tag includes commits that modify .github/workflows/ files (typically
+      a GitHub App installation token). Falls back to the default GITHUB_TOKEN
+      for runs that do not touch workflow files.
     required: false
     default: ${{ github.token }}
+
+  # --- implementation inputs (from base) ---
+  module-path:
+    description: 'Path to Go module (relative to repository root)'
+    required: false
+    default: '.'
+  go-version:
+    description: 'Minimum Go version to use (auto-upgraded if go.mod requires higher)'
+    required: false
+    default: '1.24'
+  is-sdk:
+    description: 'Whether this is an SDK module (enables SDK-specific tagging)'
+    required: false
+    default: 'false'
+  sdk-language:
+    description: 'SDK language (go, python, typescript, etc.)'
+    required: false
+    default: ''
+  run-tests:
+    description: 'Whether to run tests before release'
+    required: false
+    default: 'false'
+  run-linters:
+    description: 'Whether to run linters before release'
+    required: false
+    default: 'true'
+  create-release:
+    description: 'Whether to create a GitHub release'
+    required: false
+    default: 'true'
+  release-notes:
+    description: 'Custom release notes (markdown)'
+    required: false
+    default: ''
+  goreleaser-config:
+    description: 'Path to .goreleaser.yml config file'
+    required: false
+    default: '.goreleaser.yml'
+  goreleaser-args:
+    description: 'Additional arguments to pass to GoReleaser'
+    required: false
+    default: ''
+  skip-publish:
+    description: 'Skip publishing (use --snapshot mode)'
+    required: false
+    default: 'false'
+
+outputs:
+  tag:
+    description: 'The release tag that was created'
+    value: ${{ steps.tag-output.outputs.tag }}
+  sdk-tag:
+    description: 'The SDK-specific tag (if applicable)'
+    value: ${{ steps.sdk-tag.outputs.sdk-tag }}
+  release-url:
+    description: 'URL of the created GitHub release'
+    value: ${{ steps.goreleaser.outputs.url }}
+  artifacts:
+    description: 'List of artifacts created by GoReleaser'
+    value: ${{ steps.goreleaser.outputs.artifacts }}
 
 runs:
   using: 'composite'
@@ -59,19 +126,134 @@ runs:
       shell: bash
       run: ${{ inputs.pre-build-script }}
 
-    - name: Build and release Go via GoReleaser
-      uses: falkcorp/gha-release-go@319bd21f49f5ad1cd0f806531a0fd23d64facaa7 # v1.4.0
-      env:
-        GOEXPERIMENT: ${{ inputs.go-experiment }}
+    - name: Detect required Go version from go.mod
+      id: detect-go-version
+      shell: bash
+      run: |
+        set -euo pipefail
+        MOD_PATH="${{ inputs.module-path }}"
+        GO_REQUIRED=""
+        if [ -f "$MOD_PATH/go.mod" ]; then
+          GO_REQUIRED=$(grep -E '^go [0-9]+\.[0-9]+' "$MOD_PATH/go.mod" | awk '{print $2}' | head -n1 || true)
+        fi
+        INPUT_VER="${{ inputs.go-version }}"
+        CHOSEN="$INPUT_VER"
+        if [ -n "$GO_REQUIRED" ]; then
+          HIGHER=$(printf "%s\n%s\n" "$INPUT_VER" "$GO_REQUIRED" | sort -V | tail -n1)
+          CHOSEN="$HIGHER"
+        fi
+        echo "version=$CHOSEN" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
       with:
-        module-path: .
-        tag: ${{ inputs.release-version || github.ref_name }}
-        go-version: '1.24'
-        run-tests: 'false'
-        run-linters: 'true'
-        create-release: 'true'
-        skip-publish: 'false'
-        github-token: ${{ inputs.github-token }}
+        go-version: ${{ steps.detect-go-version.outputs.version || inputs.go-version }}
+        cache-dependency-path: ${{ inputs.module-path }}/go.sum
+
+    - name: Verify Go module
+      working-directory: ${{ inputs.module-path }}
+      shell: bash
+      run: |
+        if [ ! -f "go.mod" ]; then
+          echo "Error: go.mod not found in ${{ inputs.module-path }}"
+          exit 1
+        fi
+        echo "Module: $(go list -m)"
+
+    - name: Tidy module dependencies
+      working-directory: ${{ inputs.module-path }}
+      shell: bash
+      run: go mod tidy
+
+    - name: Run tests
+      if: inputs.run-tests == 'true'
+      working-directory: ${{ inputs.module-path }}
+      shell: bash
+      run: |
+        go test -v -race -coverprofile=coverage.out ./...
+        go tool cover -func=coverage.out
+
+    - name: Run linters
+      if: inputs.run-linters == 'true'
+      working-directory: ${{ inputs.module-path }}
+      shell: bash
+      run: |
+        go vet ./...
+        if command -v golangci-lint &> /dev/null; then
+          golangci-lint run
+        fi
+
+    - name: Generate SDK tag
+      id: sdk-tag
+      if: inputs.is-sdk == 'true' && inputs.sdk-language != ''
+      shell: bash
+      run: |
+        SDK_TAG="${{ inputs.sdk-language }}/${{ inputs.release-version || github.ref_name }}"
+        echo "sdk-tag=$SDK_TAG" >> $GITHUB_OUTPUT
+        echo "Generated SDK tag: $SDK_TAG"
+
+    - name: Set tag output
+      id: tag-output
+      shell: bash
+      run: |
+        MODULE_PATH="${{ inputs.module-path }}"
+        TAG_BASE="${{ inputs.release-version || github.ref_name }}"
+        if [ "$MODULE_PATH" != "." ]; then
+          TAG="${MODULE_PATH}/${TAG_BASE}"
+        else
+          TAG="${TAG_BASE}"
+        fi
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "Generated tag: $TAG"
+
+    - name: Create and push tags
+      if: inputs.create-release == 'true'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GOEXPERIMENT: ${{ inputs.go-experiment }}
+      run: |
+        set -euo pipefail
+        TAG="${{ steps.tag-output.outputs.tag }}"
+
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        PUSH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+        if git rev-parse "$TAG" >/dev/null 2>&1; then
+          echo "Tag $TAG already exists, skipping creation"
+        else
+          git tag -a "$TAG" -m "Release $TAG"
+          git push "$PUSH_URL" "$TAG"
+          echo "Created and pushed tag: $TAG"
+        fi
+
+        if [ "${{ inputs.is-sdk }}" == "true" ] && [ -n "${{ steps.sdk-tag.outputs.sdk-tag }}" ]; then
+          SDK_TAG="${{ steps.sdk-tag.outputs.sdk-tag }}"
+          if git rev-parse "$SDK_TAG" >/dev/null 2>&1; then
+            echo "SDK tag $SDK_TAG already exists, skipping creation"
+          else
+            git tag -a "$SDK_TAG" -m "SDK Release $SDK_TAG"
+            git push "$PUSH_URL" "$SDK_TAG"
+            echo "Created and pushed SDK tag: $SDK_TAG"
+          fi
+        fi
+
+    - name: Run GoReleaser
+      id: goreleaser
+      uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7.0.0
+      with:
+        distribution: goreleaser
+        version: v2.13.1
+        args: >-
+          release --clean
+          ${{ inputs.skip-publish == 'true' && '--snapshot' || '' }}
+          ${{ inputs.goreleaser-args }}
+        workdir: ${{ inputs.module-path }}
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GOEXPERIMENT: ${{ inputs.go-experiment }}
 
     - name: Upload Go artifacts
       if: always()
@@ -81,3 +263,18 @@ runs:
         path: dist/**
         if-no-files-found: ignore
         retention-days: 7
+
+    - name: Output summary
+      shell: bash
+      run: |
+        echo "## Go Module Release Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Module Path:** ${{ inputs.module-path }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Tag:** ${{ steps.tag-output.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ inputs.is-sdk }}" == "true" ]; then
+          echo "**SDK Tag:** ${{ steps.sdk-tag.outputs.sdk-tag }}" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "**Go Version:** ${{ steps.detect-go-version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ inputs.skip-publish }}" != "true" ]; then
+          echo "**Release URL:** ${{ steps.goreleaser.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+        fi
