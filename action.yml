@@ -60,7 +60,7 @@ runs:
       run: ${{ inputs.pre-build-script }}
 
     - name: Build and release Go via GoReleaser
-      uses: jdfalk/release-go-action@319bd21f49f5ad1cd0f806531a0fd23d64facaa7 # v1.4.0
+      uses: falkcorp/gha-release-go@319bd21f49f5ad1cd0f806531a0fd23d64facaa7 # v1.4.0
       env:
         GOEXPERIMENT: ${{ inputs.go-experiment }}
       with:
