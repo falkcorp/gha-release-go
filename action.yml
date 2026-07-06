@@ -1,5 +1,5 @@
 # file: action.yml
-# version: 2.0.0
+# version: 2.0.1
 
 name: 'Go Release Build'
 description: 'Build and release Go binaries via GoReleaser'
@@ -254,6 +254,15 @@ runs:
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
         GOEXPERIMENT: ${{ inputs.go-experiment }}
+        # Pin GoReleaser's current/previous tag explicitly instead of letting
+        # it infer via `git describe`. When a concurrent release process tags
+        # the same commit (e.g. a stable tag and an RC both landing on the
+        # same push), describe is ambiguous and can resolve to the wrong tag,
+        # causing GoReleaser to build under the wrong version and collide
+        # with that other release's already-uploaded assets. See GoReleaser's
+        # own docs on this exact scenario: "one git commit is referenced by
+        # multiple git tags" (resources/cookbooks/set-a-custom-git-tag.md).
+        GORELEASER_CURRENT_TAG: ${{ steps.tag-output.outputs.tag }}
 
     - name: Upload Go artifacts
       if: always()
